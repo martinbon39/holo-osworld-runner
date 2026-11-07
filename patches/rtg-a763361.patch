@@ -1,0 +1,51 @@
+diff --git a/Env/OSWorld/desktop_env/providers/docker/provider.py b/Env/OSWorld/desktop_env/providers/docker/provider.py
+index 5243a9b..f2ddd97 100644
+--- a/Env/OSWorld/desktop_env/providers/docker/provider.py
++++ b/Env/OSWorld/desktop_env/providers/docker/provider.py
+@@ -130,18 +130,22 @@ class DockerProvider(Provider):
+                     "happysixd/osworld-docker",
+                     environment=self.environment,
+                     cap_add=["NET_ADMIN"],
++                    mem_limit=os.environ.get("OSW_MEM_LIMIT", "5g"),
++                    memswap_limit=os.environ.get("OSW_MEM_LIMIT", "5g"),
+                     devices=devices,
+                     volumes={
+                         os.path.abspath(path_to_vm): {
+                             "bind": "/System.qcow2",
+                             "mode": "ro"
+-                        }
++                        },
++                        **({os.environ["OSW_NETWORK_SH"]: {"bind": "/run/network.sh", "mode": "ro"}}
++                           if os.environ.get("OSW_NETWORK_SH") else {})
+                     },
+                     ports={
+-                        8006: self.vnc_port,
+-                        5000: self.server_port,
+-                        9222: self.chromium_port,
+-                        8080: self.vlc_port
++                        8006: ("127.0.0.1", self.vnc_port),
++                        5000: ("127.0.0.1", self.server_port),
++                        9222: ("127.0.0.1", self.chromium_port),
++                        8080: ("127.0.0.1", self.vlc_port)
+                     },
+                     detach=True
+                 )
+diff --git a/Env/OSWorld/holo_repro/run_holo.py b/Env/OSWorld/holo_repro/run_holo.py
+index 19a16ef..d4e4971 100644
+--- a/Env/OSWorld/holo_repro/run_holo.py
++++ b/Env/OSWorld/holo_repro/run_holo.py
+@@ -445,8 +445,13 @@ def _already_done(args, domain, example_id) -> bool:
+ 
+ 
+ def _make_env(args):
++    provider = os.environ.get("OSW_PROVIDER", "docker")
++    extra = {}
++    if provider == "aws":
++        extra = {"region": os.environ.get("AWS_REGION", "us-east-1"), "client_password": "osworld-public-evaluation"}
+     return DesktopEnv(
+-        provider_name="docker",
++        **extra,
++        provider_name=provider,
+         path_to_vm=None,
+         action_space="pyautogui",
+         screen_size=(args.screen_width, args.screen_height),

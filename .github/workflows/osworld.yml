@@ -1,0 +1,243 @@
+name: osworld
+
+on:
+  workflow_dispatch:
+    inputs:
+      arm:
+        description: "Arm label (prompt = original model with the v2_verify system prompt)"
+        type: choice
+        options: [orig, patched, prompt, random]
+        default: orig
+      port:
+        description: "Pod vLLM port (8000 = production original, 8011 = patched, 8012 = variants)"
+        type: choice
+        options: ["8000", "8011", "8012"]
+        default: "8000"
+      served_model:
+        description: "vLLM served model name (also the results subdirectory)"
+        type: string
+        default: Holo-3.1-4B
+      meta_json:
+        description: "Task file in this repo, {domain: [ids]}"
+        type: string
+        default: tasks/pilot1.json
+      n_shards:
+        description: "Number of parallel jobs (1-20)"
+        type: number
+        default: 1
+      max_steps:
+        type: number
+        default: 50
+      tag:
+        description: "Free label added to artifact names (e.g. run tag), optional"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.p.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: p
+        env:
+          SERVED: ${{ inputs.served_model }}
+          META: ${{ inputs.meta_json }}
+          N: ${{ inputs.n_shards }}
+          STEPS: ${{ inputs.max_steps }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$SERVED" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad served_model"; exit 1; }
+          [[ "$META" =~ ^tasks/[A-Za-z0-9._/-]+\.json$ && "$META" != *..* && -f "$META" ]] || { echo "meta_json must be an existing tasks/*.json"; exit 1; }
+          [[ "$N" =~ ^[0-9]+$ && "$N" -ge 1 && "$N" -le 20 ]] || { echo "n_shards must be 1-20"; exit 1; }
+          [[ "$STEPS" =~ ^[0-9]+$ && "$STEPS" -ge 1 && "$STEPS" -le 200 ]] || { echo "bad max_steps"; exit 1; }
+          [[ -z "$TAG" || "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad tag"; exit 1; }
+          total=$(python3 -c "import json,sys; print(sum(map(len, json.load(open(sys.argv[1])).values())))" "$META")
+          n=$(( N < total ? N : total ))
+          echo "tasks=$total shards=$n"
+          echo "shards=$(python3 -c "import json,sys; print(json.dumps(list(range(int(sys.argv[1])))))" "$n")" >> "$GITHUB_OUTPUT"
+
+  run:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    env:
+      ARM: ${{ inputs.arm }}
+      PORT: ${{ inputs.port }}
+      SERVED: ${{ inputs.served_model }}
+      META: ${{ inputs.meta_json }}
+      N_SHARDS: ${{ strategy.job-total }}
+      SHARD: ${{ matrix.shard }}
+      MAX_STEPS: ${{ inputs.max_steps }}
+      TAG: ${{ inputs.tag }}
+      RTG_SHA: a763361f9fffad5fcbbdb16bdb51ea3ff667c183
+      VM_URL: https://huggingface.co/datasets/xlangai/ubuntu_osworld/resolve/main/Ubuntu.qcow2.zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick data disk, free space, start VM image download
+        run: |
+          set -euo pipefail
+          echo "T_START=$(date +%s)" >> "$GITHUB_ENV"
+          df -h / /mnt 2>/dev/null || true
+          # big preinstalled toolchains we never use (~30 GB), removed in the background
+          nohup sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/powershell /usr/share/swift /usr/local/julia* /opt/az \
+            /usr/local/share/chromium /opt/microsoft /opt/google > /tmp/cleanup.log 2>&1 &
+          echo $! > /tmp/cleanup.pid
+          docker image prune -af > /dev/null 2>&1 || true
+          mnt_free=$(df -BG --output=avail /mnt 2>/dev/null | tail -1 | tr -dc 0-9 || echo 0)
+          if [ "${mnt_free:-0}" -ge 45 ]; then DATA=/mnt/osw; else DATA=/home/runner/osw-data; fi
+          sudo mkdir -p "$DATA" && sudo chown "$USER" "$DATA"
+          echo "DATA=$DATA" >> "$GITHUB_ENV"
+          mkdir -p "$DATA/vm"
+          cat > /tmp/vm_dl.sh <<'EOS'
+          set -euo pipefail
+          t0=$(date +%s)
+          curl -fsSL --retry 8 --retry-delay 5 --retry-all-errors -C - -o "$DATA/vm/Ubuntu.qcow2.zip" "$VM_URL"
+          t1=$(date +%s)
+          # rm of toolchains must be done before unzipping 24 GB when the data disk is /
+          while kill -0 "$(cat /tmp/cleanup.pid)" 2>/dev/null; do sleep 2; done
+          unzip -q -o "$DATA/vm/Ubuntu.qcow2.zip" -d "$DATA/vm" && rm -f "$DATA/vm/Ubuntu.qcow2.zip"
+          t2=$(date +%s)
+          echo "vm_download_s=$((t1-t0)) vm_unzip_s=$((t2-t1))" > "$DATA/vm/DONE"
+          EOS
+          export DATA
+          nohup bash /tmp/vm_dl.sh > /tmp/vm_dl.log 2>&1 &
+
+      - name: KVM
+        run: |
+          set -euo pipefail
+          ls -l /dev/kvm
+          sudo chmod 666 /dev/kvm
+          echo "nproc=$(nproc) mem=$(free -g | awk '/Mem/{print $2}')G"
+
+      - name: Pull OSWorld docker image
+        run: docker pull -q happysixd/osworld-docker:latest
+
+      - name: RealtimeGUI @ a763361 + local patches
+        run: |
+          set -euo pipefail
+          git init -q "$DATA/rtg" && cd "$DATA/rtg"
+          git remote add origin https://github.com/1azybug/RealtimeGUI
+          git fetch -q --depth 1 origin "$RTG_SHA" && git checkout -q FETCH_HEAD
+          git apply "$GITHUB_WORKSPACE/patches/rtg-a763361.patch"
+          git diff --stat
+          mkdir -p ~/osw && ln -sfn "$DATA/rtg" ~/osw/rtg
+          mkdir -p Env/OSWorld/docker_vm_data
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: patches/rtg-a763361.patch
+
+      - name: Python 3.12 venv + requirements (CPU torch)
+        run: |
+          set -euo pipefail
+          cd ~/osw
+          uv venv -q -p 3.12 venv
+          uv pip install -q -p venv/bin/python --index-strategy unsafe-best-match \
+            --extra-index-url https://download.pytorch.org/whl/cpu -r rtg/Env/OSWorld/requirements.txt
+          uv pip install -q -p venv/bin/python -e rtg/Env
+          uv pip install -q -p venv/bin/python --no-deps -e rtg/Agent
+          echo "T_PY=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: SSH tunnel to the pod
+        env:
+          POD_SSH_KEY: ${{ secrets.POD_SSH_KEY }}
+          POD_SSH_HOST: ${{ secrets.POD_SSH_HOST }}
+          POD_SSH_PORT: ${{ secrets.POD_SSH_PORT }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          ( umask 077; printf '%s\n' "$POD_SSH_KEY" > ~/.ssh/pod )
+          export POD_SSH_HOST POD_SSH_PORT
+          nohup bash scripts/tunnel.sh > /dev/null 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -fsS -m 10 "http://127.0.0.1:$PORT/v1/models" -o /tmp/models.json 2>/dev/null; then break; fi
+            sleep 3
+          done
+          python3 - <<'EOP'
+          import json, os
+          ids = [m["id"] for m in json.load(open("/tmp/models.json"))["data"]]
+          print("served on port", os.environ["PORT"], ":", ids)
+          assert os.environ["SERVED"] in ids, f"{os.environ['SERVED']} not served on {os.environ['PORT']}"
+          EOP
+
+      - name: Wait for the VM image
+        run: |
+          set -euo pipefail
+          while [ ! -f "$DATA/vm/DONE" ]; do
+            if ! pgrep -f vm_dl.sh > /dev/null; then cat /tmp/vm_dl.log; echo "VM download failed"; exit 1; fi
+            sleep 5
+          done
+          cat "$DATA/vm/DONE"
+          mv "$DATA/vm/Ubuntu.qcow2" "$DATA/rtg/Env/OSWorld/docker_vm_data/Ubuntu.qcow2"
+          ls -l "$DATA/rtg/Env/OSWorld/docker_vm_data"; df -h / "$DATA"
+          echo "T_READY=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Run Holo on shard
+        run: |
+          set -uo pipefail
+          RES="$DATA/results"; mkdir -p "$RES/_job"
+          echo "RES=$RES" >> "$GITHUB_ENV"
+          n=$(python3 scripts/shard_meta.py "$META" "$SHARD" "$N_SHARDS" "$RES/_job/shard.json")
+          echo "shard $SHARD/$N_SHARDS: $n tasks"; cat "$RES/_job/shard.json"
+          cd "$DATA/rtg/Env/OSWorld"
+          export OSWORLD_FORCE_KVM=1 OSW_MEM_LIMIT=5g OSW_NETWORK_SH="$GITHUB_WORKSPACE/scripts/network_nft.sh" \
+            no_proxy=localhost,127.0.0.1 NO_PROXY=localhost,127.0.0.1
+          entry=holo_repro/run_holo.py; extra=()
+          if [ "$ARM" = prompt ]; then entry="$GITHUB_WORKSPACE/scripts/run_holo_verify.py"; extra=(--prompt v2_verify); fi
+          ~/osw/venv/bin/python "$entry" --base_url "http://127.0.0.1:$PORT/v1" --model "$SERVED" \
+            --result_dir "$RES" --test_meta "$RES/_job/shard.json" --workers 1 --max_steps "$MAX_STEPS" \
+            --no_recording "${extra[@]}" 2>&1 | tee "$RES/_job/run.log"
+          echo "run exit ${PIPESTATUS[0]}"
+
+      - name: Timing + summary
+        if: always()
+        run: |
+          set -u
+          RES="${RES:-$DATA/results}"; mkdir -p "$RES/_job"
+          now=$(date +%s)
+          python3 - "$RES" <<'EOP'
+          import json, os, sys, glob, pathlib
+          res = pathlib.Path(sys.argv[1]); e = os.environ
+          t = lambda k: int(e[k]) if e.get(k) else None
+          s, py, ready = t("T_START"), t("T_PY"), t("T_READY")
+          vm = open(f"{e['DATA']}/vm/DONE").read().strip() if os.path.exists(f"{e['DATA']}/vm/DONE") else ""
+          tasks = []
+          for r in sorted(res.rglob("result.txt")):
+              steps = sum(1 for l in open(r.parent / "traj.jsonl") if l.strip()) if (r.parent / "traj.jsonl").exists() else None
+              tasks.append({"task": f"{r.parent.parent.name}/{r.parent.name}", "score": r.read_text().strip(), "steps": steps})
+          now = int(__import__("time").time())
+          out = {"arm": e["ARM"], "shard": int(e["SHARD"]), "n_shards": int(e["N_SHARDS"]), "port": e["PORT"],
+                 "served_model": e["SERVED"], "meta": e["META"], "max_steps": int(e["MAX_STEPS"]),
+                 "setup_s": (ready - s) if ready else None, "python_ready_s": (py - s) if py else None, "vm": vm,
+                 "total_s": now - s, "tasks": tasks, "run_id": e.get("GITHUB_RUN_ID")}
+          (res / "_job" / "timing.json").write_text(json.dumps(out, indent=1))
+          with open(e["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"### {e['ARM']} shard {e['SHARD']}/{e['N_SHARDS']}\n\nsetup {out['setup_s']} s, total {out['total_s']} s, {vm}\n\n")
+              for x in tasks: f.write(f"- `{x['task']}` score {x['score']} steps {x['steps']}\n")
+          print(json.dumps(out, indent=1))
+          EOP
+          cp /tmp/vm_dl.log "$RES/_job/" 2>/dev/null || true
+          find "$RES" -name recording.mp4 -delete 2>/dev/null || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.arm }}${{ inputs.tag && format('-{0}', inputs.tag) || '' }}-${{ matrix.shard }}
+          path: ${{ env.DATA }}/results/
+          if-no-files-found: warn
+          retention-days: 14
