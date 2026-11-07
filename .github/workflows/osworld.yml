@@ -4,9 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       arm:
-        description: "Arm label (prompt = original model with the v2_verify system prompt)"
-        type: choice
-        options: [orig, patched, prompt, random]
+        description: "Arm label, [A-Za-z0-9_-]+ (prompt = original model with the v2_verify system prompt)"
+        type: string
         default: orig
       port:
         description: "Pod vLLM port (8000 = production original, 8011 = patched, 8012 = variants)"
@@ -45,6 +44,7 @@ jobs:
       - uses: actions/checkout@v4
       - id: p
         env:
+          ARM: ${{ inputs.arm }}
           SERVED: ${{ inputs.served_model }}
           META: ${{ inputs.meta_json }}
           N: ${{ inputs.n_shards }}
@@ -52,6 +52,7 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
+          [[ "$ARM" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "bad arm"; exit 1; }
           [[ "$SERVED" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad served_model"; exit 1; }
           [[ "$META" =~ ^tasks/[A-Za-z0-9._/-]+\.json$ && "$META" != *..* && -f "$META" ]] || { echo "meta_json must be an existing tasks/*.json"; exit 1; }
           [[ "$N" =~ ^[0-9]+$ && "$N" -ge 1 && "$N" -le 20 ]] || { echo "n_shards must be 1-20"; exit 1; }
