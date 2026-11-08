@@ -1,0 +1,18 @@
+{
+ "chrome": [
+  "9656a811-9b5b-4ddf-99c7-5117bcef0626"
+ ],
+ "libreoffice_calc": [
+  "04d9aeaf-7bed-4024-bedb-e10e6f00eb7f"
+ ],
+ "libreoffice_impress": [
+  "5c1a6c3d-c1b3-47cb-9b01-8d1b7544ffa1"
+ ],
+ "multi_apps": [
+  "185f29bd-5da0-40a6-b69c-ba7f4e0324ef",
+  "d9b7c649-c975-4f53-88f5-940b29c47247"
+ ],
+ "thunderbird": [
+  "dfac9ee8-9bc4-4cdc-b465-4a4bfcd2f397"
+ ]
+}
