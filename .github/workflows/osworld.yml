@@ -76,7 +76,7 @@ jobs:
           [[ -z "$GUARD_BASE_URL" || "$GUARD_BASE_URL" =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._/-]*)?$ ]] || { echo "bad guard_base_url"; exit 1; }
           [[ -z "$GUARD_MODEL" || "$GUARD_MODEL" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad guard_model"; exit 1; }
           [[ ( -z "$GUARD_BASE_URL" && -z "$GUARD_MODEL" ) || ( -n "$GUARD_BASE_URL" && -n "$GUARD_MODEL" && "$ARM" != prompt ) ]] || { echo "guard needs both guard_base_url and guard_model, and not arm=prompt"; exit 1; }
-          if [ -n "$GUARD_MODEL" ]; then [ -f feci_guard/run_holo_guard.py ] && [ -f feci_guard/verifier.py ] || { echo "feci_guard/ missing"; exit 1; }; fi
+          if [ -n "$GUARD_MODEL" ]; then [ -f feci_guard/run_holo_guard.py ] && [ -f feci_guard/verifier.py ] && [ -f feci_guard/feci_guard.py ] || { echo "feci_guard/ missing"; exit 1; }; fi
           [[ -z "$TAG" || "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad tag"; exit 1; }
           total=$(python3 -c "import json,sys; print(sum(map(len, json.load(open(sys.argv[1])).values())))" "$META")
           n=$(( N < total ? N : total ))
