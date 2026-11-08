@@ -40,7 +40,7 @@ on:
         type: string
         default: ""
       guard_key_secret:
-        description: "Name of the repo secret holding the judge key (e.g. ANTHROPIC_API_KEY for https://api.anthropic.com/v1)"
+        description: "Name of the repo secret holding the judge key, or NONE for a keyless judge (orbit relay on http://127.0.0.1:9911/v1 via the pod tunnel)"
         type: string
         default: MODAL_KEY
       rescue_base_url:
@@ -93,7 +93,7 @@ jobs:
           [[ "$N" =~ ^[0-9]+$ && "$N" -ge 1 && "$N" -le 20 ]] || { echo "n_shards must be 1-20"; exit 1; }
           [[ "$STEPS" =~ ^[0-9]+$ && "$STEPS" -ge 1 && "$STEPS" -le 200 ]] || { echo "bad max_steps"; exit 1; }
           [[ -z "$BASE_URL" || "$BASE_URL" =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._/-]*)?$ ]] || { echo "bad base_url"; exit 1; }
-          [[ -z "$GUARD_BASE_URL" || "$GUARD_BASE_URL" =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._/-]*)?$ ]] || { echo "bad guard_base_url"; exit 1; }
+          [[ -z "$GUARD_BASE_URL" || "$GUARD_BASE_URL" =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._/-]*)?$ || "$GUARD_BASE_URL" =~ ^http://127\.0\.0\.1:9911/v1$ ]] || { echo "bad guard_base_url"; exit 1; }
           [[ "$GUARD_KEY_SECRET" =~ ^[A-Z][A-Z0-9_]*$ ]] || { echo "bad guard_key_secret"; exit 1; }
           [[ -z "$GUARD_MODEL" || "$GUARD_MODEL" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad guard_model"; exit 1; }
           [[ ( -z "$GUARD_BASE_URL" && -z "$GUARD_MODEL" ) || ( -n "$GUARD_BASE_URL" && -n "$GUARD_MODEL" && "$ARM" != prompt ) ]] || { echo "guard needs both guard_base_url and guard_model, and not arm=prompt"; exit 1; }
@@ -132,6 +132,7 @@ jobs:
       GUARD_MODEL: ${{ inputs.guard_model }}
       RESCUE_BASE_URL: ${{ inputs.rescue_base_url }}
       RESCUE_MODEL: ${{ inputs.rescue_model }}
+      GUARD_KEY_SECRET: ${{ inputs.guard_key_secret }}
       RTG_SHA: a763361f9fffad5fcbbdb16bdb51ea3ff667c183
       VM_URL: https://huggingface.co/datasets/xlangai/ubuntu_osworld/resolve/main/Ubuntu.qcow2.zip
     steps:
@@ -174,6 +175,32 @@ jobs:
           sudo chmod 666 /dev/kvm
           echo "nproc=$(nproc) mem=$(free -g | awk '/Mem/{print $2}')G"
 
+      - name: SSH tunnel to the pod
+        if: inputs.base_url == '' || startsWith(inputs.guard_base_url, 'http://127.0.0.1')
+        env:
+          POD_SSH_KEY: ${{ secrets.POD_SSH_KEY }}
+          POD_SSH_HOST: ${{ secrets.POD_SSH_HOST }}
+          POD_SSH_PORT: ${{ secrets.POD_SSH_PORT }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          ( umask 077; printf '%s\n' "$POD_SSH_KEY" > ~/.ssh/pod )
+          export POD_SSH_HOST POD_SSH_PORT
+          nohup bash scripts/tunnel.sh > /dev/null 2>&1 &
+
+      - name: Check the served models (agent, Feci Guard judge and rescue if any)
+        env:
+          MODAL_KEY: ${{ inputs.base_url != '' && secrets.MODAL_KEY || '' }}
+          GUARD_KEY: ${{ inputs.guard_model != '' && secrets[inputs.guard_key_secret] || '' }}
+          RESCUE_KEY: ${{ inputs.rescue_model != '' && secrets[inputs.rescue_key_secret] || '' }}
+        run: |
+          set -euo pipefail
+          URL="${BASE_URL:-http://127.0.0.1:$PORT/v1}"
+          echo "MODEL_URL=$URL" >> "$GITHUB_ENV"
+          python3 scripts/check_served.py "$URL" "$SERVED" "$([ -n "$BASE_URL" ] && echo MODAL_KEY)"
+          if [ -n "$GUARD_MODEL" ]; then python3 scripts/check_served.py "$GUARD_BASE_URL" "$GUARD_MODEL" "$([ "$GUARD_KEY_SECRET" != NONE ] && echo GUARD_KEY)"; fi
+          if [ -n "$RESCUE_MODEL" ]; then python3 scripts/check_served.py "$RESCUE_BASE_URL" "$RESCUE_MODEL" RESCUE_KEY; fi
+
       - name: Pull OSWorld docker image
         run: docker pull -q happysixd/osworld-docker:latest
 
@@ -203,32 +230,6 @@ jobs:
           uv pip install -q -p venv/bin/python -e rtg/Env
           uv pip install -q -p venv/bin/python --no-deps -e rtg/Agent
           echo "T_PY=$(date +%s)" >> "$GITHUB_ENV"
-
-      - name: SSH tunnel to the pod
-        if: inputs.base_url == ''
-        env:
-          POD_SSH_KEY: ${{ secrets.POD_SSH_KEY }}
-          POD_SSH_HOST: ${{ secrets.POD_SSH_HOST }}
-          POD_SSH_PORT: ${{ secrets.POD_SSH_PORT }}
-        run: |
-          set -euo pipefail
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          ( umask 077; printf '%s\n' "$POD_SSH_KEY" > ~/.ssh/pod )
-          export POD_SSH_HOST POD_SSH_PORT
-          nohup bash scripts/tunnel.sh > /dev/null 2>&1 &
-
-      - name: Check the served models (agent, Feci Guard judge and rescue if any)
-        env:
-          MODAL_KEY: ${{ inputs.base_url != '' && secrets.MODAL_KEY || '' }}
-          GUARD_KEY: ${{ inputs.guard_model != '' && secrets[inputs.guard_key_secret] || '' }}
-          RESCUE_KEY: ${{ inputs.rescue_model != '' && secrets[inputs.rescue_key_secret] || '' }}
-        run: |
-          set -euo pipefail
-          URL="${BASE_URL:-http://127.0.0.1:$PORT/v1}"
-          echo "MODEL_URL=$URL" >> "$GITHUB_ENV"
-          python3 scripts/check_served.py "$URL" "$SERVED" "$([ -n "$BASE_URL" ] && echo MODAL_KEY)"
-          if [ -n "$GUARD_MODEL" ]; then python3 scripts/check_served.py "$GUARD_BASE_URL" "$GUARD_MODEL" GUARD_KEY; fi
-          if [ -n "$RESCUE_MODEL" ]; then python3 scripts/check_served.py "$RESCUE_BASE_URL" "$RESCUE_MODEL" RESCUE_KEY; fi
 
       - name: Wait for the VM image
         run: |
@@ -261,6 +262,7 @@ jobs:
           if [ -n "$GUARD_MODEL" ]; then
             entry="$GITHUB_WORKSPACE/feci_guard/run_holo_guard.py"
             export GUARD_BACKEND=openai GUARD_API_KEY_ENV=GUARD_KEY
+            [ "$GUARD_KEY_SECRET" = NONE ] && export GUARD_KEY=EMPTY
           fi
           if [ -n "$RESCUE_MODEL" ]; then
             entry="$GITHUB_WORKSPACE/feci_guard/run_holo_guard_rescue.py"
