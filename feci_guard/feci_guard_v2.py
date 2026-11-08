@@ -18,6 +18,7 @@ import feci_guard as v1guard
 import verifier_v2
 
 MODEL = "opus"
+UNBLOCK = os.environ.get("GUARD_V2_UNBLOCK") == "1"  # online-only feedback option (S2), off = the evaluated variant
 CLIENT_TIMEOUT_S = 150
 SERVER_TIMEOUT_S = 120
 
@@ -37,7 +38,8 @@ def _relay(instruction, path, hist_paths, actions):
     from openai import OpenAI
     url = lambda p: "data:image/png;base64," + base64.b64encode(open(p, "rb").read()).decode()
     client = OpenAI(base_url=os.environ["GUARD_V2_BASE_URL"], api_key="EMPTY", timeout=CLIENT_TIMEOUT_S, max_retries=0)
-    content = [{"type": "text", "text": "FECI_V2 " + json.dumps({"instruction": instruction, "actions": actions})}]
+    content = [{"type": "text", "text": "FECI_V2 " + json.dumps({"instruction": instruction, "actions": actions,
+                                                                "unblock": UNBLOCK})}]
     content += [{"type": "image_url", "image_url": {"url": url(p)}} for p in hist_paths + [path]]
     r = client.chat.completions.create(model="feci-guard-v2", messages=[{"role": "user", "content": content}])
     return json.loads(r.choices[0].message.content)
@@ -54,10 +56,11 @@ def check(instruction: str, screenshot_png: bytes | None, history_pngs: list[str
                 f.write(screenshot_png)
             try:
                 v = (_relay(instruction, path, hist, actions) if os.environ.get("GUARD_V2_BASE_URL")
-                     else verifier_v2.verify_v2(instruction, path, hist, actions, model=MODEL, timeout=SERVER_TIMEOUT_S))
+                     else verifier_v2.verify_v2(instruction, path, hist, actions, model=MODEL, timeout=SERVER_TIMEOUT_S,
+                                                unblock=UNBLOCK))
             except Exception as e:  # noqa: BLE001 - a broken guard must never block an answer
                 v = {"ok": False, "verdict": None, "requirements": [], "error": repr(e)[:200], "latency_s": None}
-    v["guard_version"] = "v2-ab"
+    v["guard_version"] = "v2-ab" + ("+unblock" if UNBLOCK else "")
     statuses = {r.get("status") for r in v.get("requirements", [])}
     kind = {"COMPLETE": "complete", None: "no_verdict"}.get(v.get("verdict"))
     if kind is None:

@@ -2,6 +2,8 @@
   history   the last screens before the answer (oldest first) + the list of the agent's actions (tool calls only,
             never its notes or claims), read as extra files
   model     any `claude -p` model alias (sonnet, opus)
+  unblock   (online option, not measured offline) next_action must not repeat a failed action and should prefer a
+            keyboard fallback; it only changes the feedback text the agent receives
   strict    "file evidence" prompt: a requirement whose change is not visible (formatting detail, exact value, saved
             state) is "yes" only with direct evidence at file/structure level on screen; otherwise "cannot_tell", and
             a decisive "cannot_tell" makes the verdict INCOMPLETE instead of COMPLETE.
@@ -40,8 +42,15 @@ STRICT_STEPS = """3. VERDICT: "INCOMPLETE" if at least one requirement is "no" (
 """
 
 
-def build_prompt(strict: bool, history_names: list[str], actions: list[str]) -> str:
+UNBLOCK_HINT = ("   next_action must not repeat an action the agent already tried that did not work (see its actions); "
+                "prefer a keyboard fallback (a shortcut, or the menu path) to clicking again.\n")
+
+
+def build_prompt(strict: bool, history_names: list[str], actions: list[str], unblock: bool = False) -> str:
     p = v1.PROMPT.replace(v1.PASSIVE_STEPS, STRICT_STEPS) if strict else v1.PROMPT
+    if unblock:
+        p = p.replace("Answer only with the JSON object required by the schema.",
+                      UNBLOCK_HINT + "Answer only with the JSON object required by the schema.")
     if history_names:
         block = HISTORY_BLOCK.format(history_names=", ".join(history_names),
                                      actions="\n".join(f"  {i + 1}. {a}" for i, a in enumerate(actions)) or "  (none)")
@@ -51,11 +60,11 @@ def build_prompt(strict: bool, history_names: list[str], actions: list[str]) -> 
 
 
 def verify_v2(instruction: str, image_path: str, history_images=(), actions=(), model: str = "sonnet",
-              strict: bool = False, timeout: float = v1.TIMEOUT_S) -> dict:
+              strict: bool = False, timeout: float = v1.TIMEOUT_S, unblock: bool = False) -> dict:
     t0 = time.time()
     out = {"ok": False, "verdict": None, "requirements": [], "missing_requirement": "", "evidence": "",
            "next_action": "", "model": model, "backend": "claude", "mode": "v2", "strict": strict,
-           "history": len(history_images), "error": None, "cost_usd": None}
+           "history": len(history_images), "unblock": unblock, "error": None, "cost_usd": None}
     with tempfile.TemporaryDirectory(prefix="feci2_") as work:
         name = "screen" + os.path.splitext(image_path)[1].lower()
         shutil.copy(image_path, os.path.join(work, name))
@@ -64,7 +73,7 @@ def verify_v2(instruction: str, image_path: str, history_images=(), actions=(), 
             hn = f"before_{i + 1}" + os.path.splitext(h)[1].lower()
             shutil.copy(h, os.path.join(work, hn))
             hist.append(hn)
-        prompt = build_prompt(strict, hist, list(actions)).format(instruction=instruction, image_name=name)
+        prompt = build_prompt(strict, hist, list(actions), unblock).format(instruction=instruction, image_name=name)
         cmd = [v1.CLAUDE, "-p", prompt, "--model", model, "--output-format", "json",
                "--json-schema", json.dumps(v1.SCHEMA), "--tools", "Read", "--allowedTools", "Read",
                "--strict-mcp-config", "--setting-sources", "", "--no-session-persistence"]
