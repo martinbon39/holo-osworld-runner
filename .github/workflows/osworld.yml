@@ -227,7 +227,7 @@ jobs:
           if [ "$ARM" = prompt ]; then entry="$GITHUB_WORKSPACE/scripts/run_holo_verify.py"; extra=(--prompt v2_verify); fi
           if [ -n "$GUARD_MODEL" ]; then
             entry="$GITHUB_WORKSPACE/feci_guard/run_holo_guard.py"
-            export GUARD_API_KEY_ENV=MODAL_KEY
+            export GUARD_BACKEND=openai GUARD_API_KEY_ENV=MODAL_KEY
           fi
           agent_key=EMPTY; [ -n "$BASE_URL" ] && agent_key="$MODAL_KEY"
           ~/osw/venv/bin/python "$entry" --base_url "$MODEL_URL" --model "$SERVED" --api_key "$agent_key" \
