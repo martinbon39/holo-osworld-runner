@@ -28,7 +28,7 @@ on:
         type: number
         default: 50
       base_url:
-        description: "Optional https://.../v1 model endpoint (e.g. Modal) used instead of the pod tunnel; auth headers from secret MODEL_AUTH_HEADERS"
+        description: "Optional https://.../v1 model endpoint (e.g. Modal) used instead of the pod tunnel; Bearer key from secret MODAL_KEY"
         type: string
         default: ""
       tag:
@@ -175,7 +175,7 @@ jobs:
 
       - name: Check the served model
         env:
-          MODEL_AUTH_HEADERS: ${{ secrets.MODEL_AUTH_HEADERS }}
+          MODAL_KEY: ${{ inputs.base_url != '' && secrets.MODAL_KEY || '' }}
         run: |
           set -euo pipefail
           URL="${BASE_URL:-http://127.0.0.1:$PORT/v1}"
@@ -183,7 +183,7 @@ jobs:
           python3 - "$URL" <<'EOP'
           import json, os, sys, time, urllib.request
           url, served = sys.argv[1], os.environ["SERVED"]
-          headers = json.loads(os.environ["MODEL_AUTH_HEADERS"]) if os.environ.get("BASE_URL") and os.environ.get("MODEL_AUTH_HEADERS") else {}
+          headers = {"Authorization": "Bearer " + os.environ["MODAL_KEY"]} if os.environ.get("MODAL_KEY") else {}
           for i in range(60):
               try:
                   ids = [m["id"] for m in json.load(urllib.request.urlopen(urllib.request.Request(url + "/models", headers=headers), timeout=30))["data"]]
@@ -210,7 +210,7 @@ jobs:
 
       - name: Run Holo on shard
         env:
-          MODEL_AUTH_HEADERS: ${{ inputs.base_url != '' && secrets.MODEL_AUTH_HEADERS || '' }}
+          MODAL_KEY: ${{ inputs.base_url != '' && secrets.MODAL_KEY || '' }}
         run: |
           set -uo pipefail
           RES="$DATA/results"; mkdir -p "$RES/_job"
@@ -220,10 +220,9 @@ jobs:
           cd "$DATA/rtg/Env/OSWorld"
           export OSWORLD_FORCE_KVM=1 OSW_MEM_LIMIT=5g OSW_NETWORK_SH="$GITHUB_WORKSPACE/scripts/network_nft.sh" \
             no_proxy=localhost,127.0.0.1 NO_PROXY=localhost,127.0.0.1
-          if [ -n "$BASE_URL" ]; then export PYTHONPATH="$GITHUB_WORKSPACE/scripts/pycustom"; fi
           entry=holo_repro/run_holo.py; extra=()
           if [ "$ARM" = prompt ]; then entry="$GITHUB_WORKSPACE/scripts/run_holo_verify.py"; extra=(--prompt v2_verify); fi
-          ~/osw/venv/bin/python "$entry" --base_url "$MODEL_URL" --model "$SERVED" \
+          ~/osw/venv/bin/python "$entry" --base_url "$MODEL_URL" --model "$SERVED" --api_key "${MODAL_KEY:-EMPTY}" \
             --result_dir "$RES" --test_meta "$RES/_job/shard.json" --workers 1 --max_steps "$MAX_STEPS" \
             --no_recording "${extra[@]}" 2>&1 | tee "$RES/_job/run.log"
           echo "run exit ${PIPESTATUS[0]}"
