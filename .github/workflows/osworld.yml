@@ -27,6 +27,10 @@ on:
       max_steps:
         type: number
         default: 50
+      base_url:
+        description: "Optional https://.../v1 model endpoint (e.g. Modal) used instead of the pod tunnel; auth headers from secret MODEL_AUTH_HEADERS"
+        type: string
+        default: ""
       tag:
         description: "Free label added to artifact names (e.g. run tag), optional"
         type: string
@@ -50,6 +54,7 @@ jobs:
           N: ${{ inputs.n_shards }}
           STEPS: ${{ inputs.max_steps }}
           TAG: ${{ inputs.tag }}
+          BASE_URL: ${{ inputs.base_url }}
         run: |
           set -euo pipefail
           [[ "$ARM" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "bad arm"; exit 1; }
@@ -57,6 +62,7 @@ jobs:
           [[ "$META" =~ ^tasks/[A-Za-z0-9._/-]+\.json$ && "$META" != *..* && -f "$META" ]] || { echo "meta_json must be an existing tasks/*.json"; exit 1; }
           [[ "$N" =~ ^[0-9]+$ && "$N" -ge 1 && "$N" -le 20 ]] || { echo "n_shards must be 1-20"; exit 1; }
           [[ "$STEPS" =~ ^[0-9]+$ && "$STEPS" -ge 1 && "$STEPS" -le 200 ]] || { echo "bad max_steps"; exit 1; }
+          [[ -z "$BASE_URL" || "$BASE_URL" =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._/-]*)?$ ]] || { echo "bad base_url"; exit 1; }
           [[ -z "$TAG" || "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad tag"; exit 1; }
           total=$(python3 -c "import json,sys; print(sum(map(len, json.load(open(sys.argv[1])).values())))" "$META")
           n=$(( N < total ? N : total ))
@@ -81,6 +87,7 @@ jobs:
       SHARD: ${{ matrix.shard }}
       MAX_STEPS: ${{ inputs.max_steps }}
       TAG: ${{ inputs.tag }}
+      BASE_URL: ${{ inputs.base_url }}
       RTG_SHA: a763361f9fffad5fcbbdb16bdb51ea3ff667c183
       VM_URL: https://huggingface.co/datasets/xlangai/ubuntu_osworld/resolve/main/Ubuntu.qcow2.zip
     steps:
@@ -154,6 +161,7 @@ jobs:
           echo "T_PY=$(date +%s)" >> "$GITHUB_ENV"
 
       - name: SSH tunnel to the pod
+        if: inputs.base_url == ''
         env:
           POD_SSH_KEY: ${{ secrets.POD_SSH_KEY }}
           POD_SSH_HOST: ${{ secrets.POD_SSH_HOST }}
@@ -164,15 +172,28 @@ jobs:
           ( umask 077; printf '%s\n' "$POD_SSH_KEY" > ~/.ssh/pod )
           export POD_SSH_HOST POD_SSH_PORT
           nohup bash scripts/tunnel.sh > /dev/null 2>&1 &
-          for i in $(seq 1 60); do
-            if curl -fsS -m 10 "http://127.0.0.1:$PORT/v1/models" -o /tmp/models.json 2>/dev/null; then break; fi
-            sleep 3
-          done
-          python3 - <<'EOP'
-          import json, os
-          ids = [m["id"] for m in json.load(open("/tmp/models.json"))["data"]]
-          print("served on port", os.environ["PORT"], ":", ids)
-          assert os.environ["SERVED"] in ids, f"{os.environ['SERVED']} not served on {os.environ['PORT']}"
+
+      - name: Check the served model
+        env:
+          MODEL_AUTH_HEADERS: ${{ secrets.MODEL_AUTH_HEADERS }}
+        run: |
+          set -euo pipefail
+          URL="${BASE_URL:-http://127.0.0.1:$PORT/v1}"
+          echo "MODEL_URL=$URL" >> "$GITHUB_ENV"
+          python3 - "$URL" <<'EOP'
+          import json, os, sys, time, urllib.request
+          url, served = sys.argv[1], os.environ["SERVED"]
+          headers = json.loads(os.environ["MODEL_AUTH_HEADERS"]) if os.environ.get("BASE_URL") and os.environ.get("MODEL_AUTH_HEADERS") else {}
+          for i in range(60):
+              try:
+                  ids = [m["id"] for m in json.load(urllib.request.urlopen(urllib.request.Request(url + "/models", headers=headers), timeout=30))["data"]]
+                  break
+              except Exception as e:
+                  print("models not reachable yet:", type(e).__name__); time.sleep(5)
+          else:
+              sys.exit("model endpoint unreachable")
+          print("served:", ids)
+          assert served in ids, f"{served} not served"
           EOP
 
       - name: Wait for the VM image
@@ -188,6 +209,8 @@ jobs:
           echo "T_READY=$(date +%s)" >> "$GITHUB_ENV"
 
       - name: Run Holo on shard
+        env:
+          MODEL_AUTH_HEADERS: ${{ inputs.base_url != '' && secrets.MODEL_AUTH_HEADERS || '' }}
         run: |
           set -uo pipefail
           RES="$DATA/results"; mkdir -p "$RES/_job"
@@ -197,9 +220,10 @@ jobs:
           cd "$DATA/rtg/Env/OSWorld"
           export OSWORLD_FORCE_KVM=1 OSW_MEM_LIMIT=5g OSW_NETWORK_SH="$GITHUB_WORKSPACE/scripts/network_nft.sh" \
             no_proxy=localhost,127.0.0.1 NO_PROXY=localhost,127.0.0.1
+          if [ -n "$BASE_URL" ]; then export PYTHONPATH="$GITHUB_WORKSPACE/scripts/pycustom"; fi
           entry=holo_repro/run_holo.py; extra=()
           if [ "$ARM" = prompt ]; then entry="$GITHUB_WORKSPACE/scripts/run_holo_verify.py"; extra=(--prompt v2_verify); fi
-          ~/osw/venv/bin/python "$entry" --base_url "http://127.0.0.1:$PORT/v1" --model "$SERVED" \
+          ~/osw/venv/bin/python "$entry" --base_url "$MODEL_URL" --model "$SERVED" \
             --result_dir "$RES" --test_meta "$RES/_job/shard.json" --workers 1 --max_steps "$MAX_STEPS" \
             --no_recording "${extra[@]}" 2>&1 | tee "$RES/_job/run.log"
           echo "run exit ${PIPESTATUS[0]}"
