@@ -55,6 +55,11 @@ on:
         description: "Name of the repo secret holding the rescue key"
         type: string
         default: MODAL_KEY
+      tunnel_host:
+        description: "SSH tunnel target: pod (ports 8000/8011/8012/9911) or orbit (judge relay 9911 only; the agent must use base_url)"
+        type: choice
+        options: [pod, orbit]
+        default: pod
       tag:
         description: "Free label added to artifact names (e.g. run tag), optional"
         type: string
@@ -85,6 +90,7 @@ jobs:
           RESCUE_BASE_URL: ${{ inputs.rescue_base_url }}
           RESCUE_MODEL: ${{ inputs.rescue_model }}
           RESCUE_KEY_SECRET: ${{ inputs.rescue_key_secret }}
+          TUNNEL_HOST_SEL: ${{ inputs.tunnel_host }}
         run: |
           set -euo pipefail
           [[ "$ARM" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "bad arm"; exit 1; }
@@ -103,6 +109,7 @@ jobs:
           [[ -z "$RESCUE_MODEL" || "$RESCUE_MODEL" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad rescue_model"; exit 1; }
           [[ ( -z "$RESCUE_BASE_URL" && -z "$RESCUE_MODEL" ) || ( -n "$RESCUE_BASE_URL" && -n "$RESCUE_MODEL" && -n "$GUARD_MODEL" ) ]] || { echo "rescue needs rescue_base_url, rescue_model and a guard"; exit 1; }
           if [ -n "$RESCUE_MODEL" ]; then [ -f feci_guard/run_holo_guard_rescue.py ] || { echo "feci_guard/run_holo_guard_rescue.py missing"; exit 1; }; fi
+          [[ "$TUNNEL_HOST_SEL" != orbit || -n "$BASE_URL" ]] || { echo "tunnel_host=orbit needs the agent on base_url"; exit 1; }
           [[ -z "$TAG" || "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad tag"; exit 1; }
           total=$(python3 -c "import json,sys; print(sum(map(len, json.load(open(sys.argv[1])).values())))" "$META")
           n=$(( N < total ? N : total ))
@@ -175,17 +182,27 @@ jobs:
           sudo chmod 666 /dev/kvm
           echo "nproc=$(nproc) mem=$(free -g | awk '/Mem/{print $2}')G"
 
-      - name: SSH tunnel to the pod
+      - name: SSH tunnel (pod, or orbit for the judge relay)
         if: inputs.base_url == '' || startsWith(inputs.guard_base_url, 'http://127.0.0.1')
         env:
-          POD_SSH_KEY: ${{ secrets.POD_SSH_KEY }}
+          POD_SSH_KEY: ${{ inputs.tunnel_host == 'pod' && secrets.POD_SSH_KEY || '' }}
           POD_SSH_HOST: ${{ secrets.POD_SSH_HOST }}
           POD_SSH_PORT: ${{ secrets.POD_SSH_PORT }}
+          ORBIT_TUNNEL_KEY: ${{ inputs.tunnel_host == 'orbit' && secrets.ORBIT_TUNNEL_KEY || '' }}
+          ORBIT_TUNNEL_HOST: ${{ secrets.ORBIT_TUNNEL_HOST }}
+          ORBIT_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPCq/qlYspKZTuawJxDew9kTFHCr7y6PSn00/xK5IF+P
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          ( umask 077; printf '%s\n' "$POD_SSH_KEY" > ~/.ssh/pod )
-          export POD_SSH_HOST POD_SSH_PORT
+          if [ "${{ inputs.tunnel_host }}" = orbit ]; then
+            [ -n "$ORBIT_TUNNEL_KEY" ] && [ -n "$ORBIT_TUNNEL_HOST" ] || { echo "secrets ORBIT_TUNNEL_KEY / ORBIT_TUNNEL_HOST missing"; exit 1; }
+            ( umask 077; printf '%s\n' "$ORBIT_TUNNEL_KEY" > ~/.ssh/tunnel; printf '%s %s\n' "$ORBIT_TUNNEL_HOST" "$ORBIT_HOST_KEY" > ~/.ssh/tunnel_known_hosts )
+            export TUNNEL_USER=orbit TUNNEL_HOST="$ORBIT_TUNNEL_HOST" TUNNEL_PORT=22 TUNNEL_FORWARDS="9911"
+          else
+            ( umask 077; printf '%s\n' "$POD_SSH_KEY" > ~/.ssh/tunnel )
+            export TUNNEL_USER=root TUNNEL_HOST="$POD_SSH_HOST" TUNNEL_PORT="$POD_SSH_PORT" TUNNEL_FORWARDS="8000 8011 8012 9911"
+          fi
+          export TUNNEL_KEY=~/.ssh/tunnel TUNNEL_KNOWN_HOSTS=~/.ssh/tunnel_known_hosts
           nohup bash scripts/tunnel.sh > /dev/null 2>&1 &
 
       - name: Check the served models (agent, Feci Guard judge and rescue if any)
