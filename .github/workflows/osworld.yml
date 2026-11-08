@@ -32,13 +32,17 @@ on:
         type: string
         default: ""
       guard_base_url:
-        description: "Feci Guard judge endpoint https://.../v1 (Bearer MODAL_KEY); empty = no guard"
+        description: "Feci Guard judge endpoint https://.../v1 (key from secret guard_key_secret); empty = no guard"
         type: string
         default: ""
       guard_model:
         description: "Feci Guard judge served model (e.g. Holo4-27B); empty = no guard"
         type: string
         default: ""
+      guard_key_secret:
+        description: "Name of the repo secret holding the judge key (e.g. ANTHROPIC_API_KEY for https://api.anthropic.com/v1)"
+        type: string
+        default: MODAL_KEY
       tag:
         description: "Free label added to artifact names (e.g. run tag), optional"
         type: string
@@ -65,6 +69,7 @@ jobs:
           BASE_URL: ${{ inputs.base_url }}
           GUARD_BASE_URL: ${{ inputs.guard_base_url }}
           GUARD_MODEL: ${{ inputs.guard_model }}
+          GUARD_KEY_SECRET: ${{ inputs.guard_key_secret }}
         run: |
           set -euo pipefail
           [[ "$ARM" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "bad arm"; exit 1; }
@@ -74,6 +79,7 @@ jobs:
           [[ "$STEPS" =~ ^[0-9]+$ && "$STEPS" -ge 1 && "$STEPS" -le 200 ]] || { echo "bad max_steps"; exit 1; }
           [[ -z "$BASE_URL" || "$BASE_URL" =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._/-]*)?$ ]] || { echo "bad base_url"; exit 1; }
           [[ -z "$GUARD_BASE_URL" || "$GUARD_BASE_URL" =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._/-]*)?$ ]] || { echo "bad guard_base_url"; exit 1; }
+          [[ "$GUARD_KEY_SECRET" =~ ^[A-Z][A-Z0-9_]*$ ]] || { echo "bad guard_key_secret"; exit 1; }
           [[ -z "$GUARD_MODEL" || "$GUARD_MODEL" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad guard_model"; exit 1; }
           [[ ( -z "$GUARD_BASE_URL" && -z "$GUARD_MODEL" ) || ( -n "$GUARD_BASE_URL" && -n "$GUARD_MODEL" && "$ARM" != prompt ) ]] || { echo "guard needs both guard_base_url and guard_model, and not arm=prompt"; exit 1; }
           if [ -n "$GUARD_MODEL" ]; then [ -f feci_guard/run_holo_guard.py ] && [ -f feci_guard/verifier.py ] && [ -f feci_guard/feci_guard.py ] || { echo "feci_guard/ missing"; exit 1; }; fi
@@ -191,13 +197,14 @@ jobs:
 
       - name: Check the served models (agent, and Feci Guard judge if any)
         env:
-          MODAL_KEY: ${{ (inputs.base_url != '' || inputs.guard_model != '') && secrets.MODAL_KEY || '' }}
+          MODAL_KEY: ${{ inputs.base_url != '' && secrets.MODAL_KEY || '' }}
+          GUARD_KEY: ${{ inputs.guard_model != '' && secrets[inputs.guard_key_secret] || '' }}
         run: |
           set -euo pipefail
           URL="${BASE_URL:-http://127.0.0.1:$PORT/v1}"
           echo "MODEL_URL=$URL" >> "$GITHUB_ENV"
-          python3 scripts/check_served.py "$URL" "$SERVED" "$([ -n "$BASE_URL" ] && echo bearer || echo none)"
-          if [ -n "$GUARD_MODEL" ]; then python3 scripts/check_served.py "$GUARD_BASE_URL" "$GUARD_MODEL" bearer; fi
+          python3 scripts/check_served.py "$URL" "$SERVED" "$([ -n "$BASE_URL" ] && echo MODAL_KEY)"
+          if [ -n "$GUARD_MODEL" ]; then python3 scripts/check_served.py "$GUARD_BASE_URL" "$GUARD_MODEL" GUARD_KEY; fi
 
       - name: Wait for the VM image
         run: |
@@ -213,7 +220,8 @@ jobs:
 
       - name: Run Holo on shard
         env:
-          MODAL_KEY: ${{ (inputs.base_url != '' || inputs.guard_model != '') && secrets.MODAL_KEY || '' }}
+          MODAL_KEY: ${{ inputs.base_url != '' && secrets.MODAL_KEY || '' }}
+          GUARD_KEY: ${{ inputs.guard_model != '' && secrets[inputs.guard_key_secret] || '' }}
         run: |
           set -uo pipefail
           RES="$DATA/results"; mkdir -p "$RES/_job"
@@ -227,7 +235,7 @@ jobs:
           if [ "$ARM" = prompt ]; then entry="$GITHUB_WORKSPACE/scripts/run_holo_verify.py"; extra=(--prompt v2_verify); fi
           if [ -n "$GUARD_MODEL" ]; then
             entry="$GITHUB_WORKSPACE/feci_guard/run_holo_guard.py"
-            export GUARD_BACKEND=openai GUARD_API_KEY_ENV=MODAL_KEY
+            export GUARD_BACKEND=openai GUARD_API_KEY_ENV=GUARD_KEY
           fi
           agent_key=EMPTY; [ -n "$BASE_URL" ] && agent_key="$MODAL_KEY"
           ~/osw/venv/bin/python "$entry" --base_url "$MODEL_URL" --model "$SERVED" --api_key "$agent_key" \
