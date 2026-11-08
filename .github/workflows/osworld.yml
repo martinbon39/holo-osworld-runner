@@ -232,7 +232,26 @@ jobs:
           mkdir -p ~/osw && ln -sfn "$DATA/rtg" ~/osw/rtg
           mkdir -p Env/OSWorld/docker_vm_data
 
-      - uses: astral-sh/setup-uv@v6
+      # setup-uv has no retry; GitHub's download endpoint returned transient 504s (run 42468308809)
+      - id: uv1
+        uses: astral-sh/setup-uv@v6
+        continue-on-error: true
+        with:
+          enable-cache: true
+          cache-dependency-glob: patches/rtg-a763361.patch
+      - if: steps.uv1.outcome == 'failure'
+        run: sleep 30
+      - id: uv2
+        if: steps.uv1.outcome == 'failure'
+        uses: astral-sh/setup-uv@v6
+        continue-on-error: true
+        with:
+          enable-cache: true
+          cache-dependency-glob: patches/rtg-a763361.patch
+      - if: steps.uv2.outcome == 'failure'
+        run: sleep 60
+      - if: steps.uv2.outcome == 'failure'
+        uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
           cache-dependency-glob: patches/rtg-a763361.patch
@@ -252,7 +271,10 @@ jobs:
         run: |
           set -euo pipefail
           while [ ! -f "$DATA/vm/DONE" ]; do
-            if ! pgrep -f vm_dl.sh > /dev/null; then cat /tmp/vm_dl.log; echo "VM download failed"; exit 1; fi
+            if ! pgrep -f vm_dl.sh > /dev/null; then
+              [ -f "$DATA/vm/DONE" ] && break
+              cat /tmp/vm_dl.log; echo "VM download failed"; exit 1
+            fi
             sleep 5
           done
           cat "$DATA/vm/DONE"
