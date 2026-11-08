@@ -7,9 +7,11 @@ Environment (keys are read only from the variables named here, never from the co
   RESCUE_BASE_URL       OpenAI-compatible endpoint of the rescue model (e.g. https://…modal.run/v1)
   RESCUE_MODEL          served model name (e.g. Holo4-27B)
   RESCUE_API_KEY_ENV    NAME of the variable holding its key (sent as Bearer)
+  RESCUE_TIMEOUT_S      per HTTP call, default 120, no SDK retry (the frozen _call_model already retries 4 times)
   Guard judge: GUARD_BACKEND / GUARD_BASE_URL / GUARD_MODEL / GUARD_API_KEY_ENV, see verifier.py.
 The rescue model is called through the frozen HoloComputerAgent._call_model (same prompt, schema, sampling).
-meta.json "feci_guard" gains "rescue": {model, escalated_at_step, calls}.
+meta.json "feci_guard" gains "rescue": {model, escalated_at_step (the refused step), calls (model-call attempts)}.
+Use a fresh --result_dir: result paths keep the agent's --model name and finished tasks are skipped on resume.
 """
 from __future__ import annotations
 
@@ -29,7 +31,8 @@ class RescueGuardedAgent(RG.GuardedAgent):
         super().__init__(*a, **kw)
         self.rescue_model = os.environ["RESCUE_MODEL"]
         self.rescue_client = OpenAI(base_url=os.environ["RESCUE_BASE_URL"],
-                                    api_key=os.environ[os.environ["RESCUE_API_KEY_ENV"]], timeout=300)
+                                    api_key=os.environ[os.environ["RESCUE_API_KEY_ENV"]],
+                                    timeout=float(os.environ.get("RESCUE_TIMEOUT_S", 120)), max_retries=0)
         self.escalated_at = None
         self.rescue_calls = 0
 
@@ -40,7 +43,7 @@ class RescueGuardedAgent(RG.GuardedAgent):
             self.client, self.model = self.rescue_client, self.rescue_model
             log.info("[rescue] step %d: Guard refused, the episode continues with %s", step_idx + 1, self.model)
             with open(os.path.join(self.guard_dir, "guard.md"), "a", encoding="utf-8") as f:
-                f.write(f"**Escalation:** from step {step_idx + 2} the agent is {self.model}.\n\n")
+                f.write(f"**Escalation:** after the refusal at step {step_idx + 1}, the agent is {self.model}.\n\n")
         return rec
 
     def _call_model(self, messages):
